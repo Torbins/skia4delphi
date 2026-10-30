@@ -160,21 +160,54 @@ type
 
   { TSkBitmapHandle }
 
+  /// <summary>
+  ///   Pixels of a bitmap of the Skia canvases, stored in a raster surface
+  ///   that owns them. Copies share an immutable snapshot of the surface, and
+  ///   Skia only duplicates the pixels when one of the sides is modified
+  ///   (copy-on-write).
+  /// </summary>
   TSkBitmapHandle = class
   private
-    function GetPixels: Pointer; overload;
-    function GetPixels(AInitializeToZero: Boolean): Pointer; overload; inline;
+    FDrawCount: Integer;
+    function BeginDraw: ISkSurface;
+    procedure EndDraw; inline;
+    function GetPixels: Pointer;
+    function GetSurface: ISkSurface;
+    function IsInUse: Boolean; inline;
+    function Map(const AAccess: TMapAccess; out ARowBytes: NativeUInt): Pointer;
+    function PeekPixelsForWrite: ISkPixmap;
+    function SetContent(const AImage: ISkImage): Boolean;
+    procedure Unmap;
   strict private
     FHeight: Integer;
+    // Content shared with another handle while this one has not been modified.
+    // It is only used when there is no surface.
+    FImage: ISkImage;
+    FLibraryReferenced: Boolean;
+    FMapCount: Integer;
+    FMappedForWrite: Boolean;
     FPixelFormat: TPixelFormat;
-    FPixels: Pointer;
     FPixelsBytes: NativeUInt;
+    FSurface: ISkSurface;
     FWidth: Integer;
+    function GetImageInfo: TSkImageInfo; inline;
+    function GetRowBytes: NativeUInt; inline;
   public
     constructor Create(const AWidth, AHeight: Integer; const APixelFormat: TPixelFormat);
     destructor Destroy; override;
+    /// <summary>
+    ///   Returns an immutable image of the current content without copying
+    ///   the pixels, or nil when the bitmap has no pixels.
+    /// </summary>
+    function MakeSnapshot: ISkImage;
+    /// <summary>
+    ///   Returns the pixels for reading only, or nil when the bitmap has no
+    ///   pixels. They may be shared with other bitmaps and images.
+    /// </summary>
+    function PeekPixels: ISkPixmap;
     property Height: Integer read FHeight;
     property PixelFormat: TPixelFormat read FPixelFormat;
+    /// <summary>Pixels prepared to be modified directly.</summary>
     property Pixels: Pointer read GetPixels;
     property PixelsBytes: NativeUInt read FPixelsBytes;
     property Width: Integer read FWidth;
@@ -184,8 +217,10 @@ type
 
   TSkCanvasBase = class abstract(TSkCanvasCustom)
   strict private
+    FBitmapHandle: TSkBitmapHandle;
     FBitmapSurface: ISkSurface;
     FSurface: TSkSurface;
+    class function CopyHandleToBitmap(const ASource: THandle; const ADest: FMX.Graphics.TBitmap): Boolean;
   strict protected
     {$IFDEF MSWINDOWS}
     {$IF CompilerVersion <= 36}
@@ -201,7 +236,17 @@ type
     procedure Resized; override;
     {$ENDIF}
     procedure SwapBuffers(const AContextHandle: THandle); virtual;
+    /// <summary>
+    ///   Makes the destination share the content of the source, without
+    ///   copying pixels. Returns False when the copy must be done by FMX.
+    /// </summary>
+    class function CopyBitmapHandle(const ASource, ADest: TSkBitmapHandle): Boolean; virtual;
     class function CreateBitmap(const AWidth, AHeight: Integer; const APixelFormat: TPixelFormat): TSkBitmapHandle; virtual;
+    {$IF CompilerVersion >= 37}
+    class function DoCopyImageToBitmap(const ASource: THandle; const ADest: FMX.Graphics.TBitmap): Boolean; override;
+    {$ELSE}
+    class procedure DoCopyBitmap(const ASource, ADest: FMX.Graphics.TBitmap); override;
+    {$ENDIF}
     class procedure DoFinalizeBitmap(var ABitmapHandle: THandle); override;
     class function DoInitializeBitmap(const AWidth, AHeight: Integer; const AScale: Single; var APixelFormat: TPixelFormat): THandle; override;
     class function DoMapBitmap(const ABitmapHandle: THandle; const AAccess: TMapAccess; var ABitmapData: TBitmapData): Boolean; override;
@@ -314,6 +359,7 @@ type
     procedure EndCanvas(const AContextHandle: THandle); override;
     function GetCachedImage(const ABitmap: TBitmap): TSkImage; override; final;
     function SupportsCachedImage: Boolean; override;
+    class function CopyBitmapHandle(const ASource, ADest: TSkBitmapHandle): Boolean; override;
     class function CreateBitmap(const AWidth, AHeight: Integer; const APixelFormat: TPixelFormat): TSkBitmapHandle; override;
     class function DoMapBitmap(const ABitmapHandle: THandle; const AAccess: TMapAccess; var ABitmapData: TBitmapData): Boolean; override;
     class procedure DoFinalizeBitmap(var ABitmapHandle: THandle); override;
@@ -1767,6 +1813,10 @@ type
 
 {$ENDIF}
 
+  { TBitmapAccess }
+
+  TBitmapAccess = class(FMX.Graphics.TBitmap);
+
   { TSkCanvasCustomHelper }
 
   // TODO: Move this GetSamplingOptions overload into TSkCanvasCustom in the next major version.
@@ -1799,6 +1849,20 @@ begin
   {$ELSE}
   Result := TPixelFormat.RGBA;
   {$ENDIF}
+end;
+
+// Returns nil when the bitmap does not belong to a TSkCanvasBase, whose
+// content must then be mapped.
+function MakeBitmapSnapshot(const ABitmap: FMX.Graphics.TBitmap): ISkImage;
+begin
+  if not ABitmap.CanvasClass.InheritsFrom(TSkCanvasBase) then
+    Exit(nil);
+  TMonitor.Enter(ABitmap);
+  try
+    Result := TSkBitmapHandle(ABitmap.Handle).MakeSnapshot;
+  finally
+    TMonitor.Exit(ABitmap);
+  end;
 end;
 
 { TSkCanvasCustom }
@@ -1966,11 +2030,13 @@ begin
           end;
           if LCache = nil then
           begin
-            ABrushData.BitmapMapped := ABrushData.Brush.Bitmap.Bitmap.Map(TMapAccess.Read, ABrushData.BitmapData);
-            if ABrushData.BitmapMapped then
+            LImage := MakeBitmapSnapshot(ABrushData.Brush.Bitmap.Bitmap);
+            ABrushData.BitmapMapped := (LImage = nil) and ABrushData.Brush.Bitmap.Bitmap.Map(TMapAccess.Read, ABrushData.BitmapData);
+            if (LImage <> nil) or ABrushData.BitmapMapped then
             begin
               ABrushData.Paint.AlphaF := AOpacity;
-              LImage := TSkImage.MakeFromRaster(TSkImageInfo.Create(ABrushData.BitmapData.Width, ABrushData.BitmapData.Height, SkFmxColorType[ABrushData.BitmapData.PixelFormat]), ABrushData.BitmapData.Data, NativeUInt(ABrushData.BitmapData.Pitch));
+              if ABrushData.BitmapMapped then
+                LImage := TSkImage.MakeFromRaster(TSkImageInfo.Create(ABrushData.BitmapData.Width, ABrushData.BitmapData.Height, SkFmxColorType[ABrushData.BitmapData.PixelFormat]), ABrushData.BitmapData.Data, NativeUInt(ABrushData.BitmapData.Pitch));
               if LImage <> nil then
               begin
                 if ABrushData.Brush.Bitmap.WrapMode = TWrapMode.TileStretch then
@@ -2175,7 +2241,10 @@ begin
     end;
     if LCache = nil then
     begin
-      if ABitmap.Map(TMapAccess.Read, LBitmapData) then
+      LImage := MakeBitmapSnapshot(ABitmap);
+      if LImage <> nil then
+        Canvas.DrawImageRect(LImage, LSrcRect, ADestRect, GetSamplingOptions(LSrcRect, ADestRect, AHighSpeed), LPaint)
+      else if ABitmap.Map(TMapAccess.Read, LBitmapData) then
       begin
         try
           LImage := TSkImage.MakeFromRaster(TSkImageInfo.Create(LBitmapData.Width, LBitmapData.Height, SkFmxColorType[LBitmapData.PixelFormat]), LBitmapData.Data, NativeUInt(LBitmapData.Pitch));
@@ -2641,6 +2710,10 @@ constructor TSkBitmapHandle.Create(const AWidth, AHeight: Integer;
   const APixelFormat: TPixelFormat);
 begin
   inherited Create;
+  // The pixels are Skia objects, so the library must stay loaded while the
+  // bitmap exists, even after the canvases have been destroyed.
+  SkInitialize;
+  FLibraryReferenced := True;
   FWidth       := AWidth;
   FHeight      := AHeight;
   FPixelFormat := APixelFormat;
@@ -2650,25 +2723,165 @@ end;
 
 destructor TSkBitmapHandle.Destroy;
 begin
-  FreeMem(FPixels);
+  // The Skia objects must be released before the library reference.
+  FSurface := nil;
+  FImage   := nil;
+  if FLibraryReferenced then
+    SkFinalize;
   inherited;
 end;
 
-function TSkBitmapHandle.GetPixels(AInitializeToZero: Boolean): Pointer;
+function TSkBitmapHandle.BeginDraw: ISkSurface;
 begin
-  if (FPixels = nil) and (FPixelsBytes > 0) then
-  begin
-    if AInitializeToZero then
-      FPixels := AllocMem(FPixelsBytes)
-    else
-      GetMem(FPixels, FPixelsBytes);
-  end;
-  Result := FPixels;
+  // Drawing through the canvas of the surface already makes Skia detach the
+  // pixels from the snapshots still in use.
+  Result := GetSurface;
+  if Result <> nil then
+    Inc(FDrawCount);
+end;
+
+procedure TSkBitmapHandle.EndDraw;
+begin
+  Dec(FDrawCount);
+end;
+
+function TSkBitmapHandle.GetImageInfo: TSkImageInfo;
+begin
+  Result := TSkImageInfo.Create(FWidth, FHeight, SkFmxColorType[FPixelFormat]);
 end;
 
 function TSkBitmapHandle.GetPixels: Pointer;
+var
+  LPixmap: ISkPixmap;
 begin
-  Result := GetPixels(True);
+  LPixmap := PeekPixelsForWrite;
+  if LPixmap = nil then
+    Result := nil
+  else
+    Result := LPixmap.Pixels;
+end;
+
+function TSkBitmapHandle.GetRowBytes: NativeUInt;
+begin
+  Result := NativeUInt(FWidth) * NativeUInt(PixelFormatBytes[FPixelFormat]);
+end;
+
+function TSkBitmapHandle.GetSurface: ISkSurface;
+begin
+  if (FSurface = nil) and (FPixelsBytes > 0) then
+  begin
+    // The pixels of a new raster surface are initialized to zero.
+    FSurface := TSkSurface.MakeRaster(GetImageInfo, GetRowBytes);
+    if (FSurface <> nil) and (FImage <> nil) then
+      FImage.ReadPixels(FSurface.PeekPixels);
+    FImage := nil;
+  end;
+  Result := FSurface;
+end;
+
+function TSkBitmapHandle.IsInUse: Boolean;
+begin
+  Result := (FDrawCount > 0) or (FMapCount > 0);
+end;
+
+function TSkBitmapHandle.MakeSnapshot: ISkImage;
+begin
+  if FSurface = nil then
+  begin
+    if FImage <> nil then
+      Exit(FImage);
+    if GetSurface = nil then
+      Exit(nil);
+  end;
+  // While mapped for writing, the pixels can still be changed through the
+  // pointer, so they cannot be shared.
+  if FMappedForWrite then
+    Result := TSkImage.MakeRasterCopy(FSurface.PeekPixels)
+  else
+    Result := FSurface.MakeImageSnapshot;
+end;
+
+function TSkBitmapHandle.Map(const AAccess: TMapAccess;
+  out ARowBytes: NativeUInt): Pointer;
+var
+  LPixmap: ISkPixmap;
+begin
+  if AAccess = TMapAccess.Read then
+    LPixmap := PeekPixels
+  else
+  begin
+    LPixmap := PeekPixelsForWrite;
+    FMappedForWrite := True;
+  end;
+  Inc(FMapCount);
+  if LPixmap = nil then
+  begin
+    ARowBytes := GetRowBytes;
+    Result    := nil;
+  end
+  else
+  begin
+    ARowBytes := LPixmap.RowBytes;
+    Result    := LPixmap.Pixels;
+  end;
+end;
+
+function TSkBitmapHandle.PeekPixels: ISkPixmap;
+begin
+  if (FSurface = nil) and (FImage <> nil) then
+  begin
+    Result := FImage.PeekPixels;
+    if Result <> nil then
+      Exit;
+  end;
+  if GetSurface = nil then
+    Exit(nil);
+  Result := FSurface.PeekPixels;
+end;
+
+function TSkBitmapHandle.PeekPixelsForWrite: ISkPixmap;
+var
+  LPixel: array[0..15] of Byte;
+begin
+  if GetSurface = nil then
+    Exit(nil);
+  // Pixels modified directly do not notify the surface, so writing one pixel
+  // back makes Skia detach them from the snapshots still in use first.
+  Result := FSurface.PeekPixels;
+  Move(Result.Pixels^, LPixel, PixelFormatBytes[FPixelFormat]);
+  FSurface.WritePixels(GetImageInfo.MakeDimensions(1, 1), @LPixel, PixelFormatBytes[FPixelFormat]);
+  Result := FSurface.PeekPixels;
+end;
+
+function TSkBitmapHandle.SetContent(const AImage: ISkImage): Boolean;
+var
+  LPixmap: ISkPixmap;
+begin
+  // The surface cannot be replaced while a canvas or a mapping uses it, so the
+  // pixels are copied into it instead.
+  if (FSurface <> nil) and IsInUse then
+  begin
+    if AImage = nil then
+      Exit(False);
+    LPixmap := AImage.PeekPixels;
+    if LPixmap = nil then
+      Exit(False);
+    FSurface.WritePixels(LPixmap);
+  end
+  else
+  begin
+    FSurface := nil;
+    FImage   := AImage;
+  end;
+  Result := True;
+end;
+
+procedure TSkBitmapHandle.Unmap;
+begin
+  // TBitmap only unmaps once when maps are nested, so the flag is not counted.
+  FMappedForWrite := False;
+  if FMapCount > 0 then
+    Dec(FMapCount);
 end;
 
 { TSkCanvasBase }
@@ -2687,11 +2900,39 @@ begin
   else if Bitmap <> nil then
   begin
     LBitmap := TSkBitmapHandle(Bitmap.Handle);
-    FBitmapSurface := TSkSurface.MakeRasterDirect(TSkImageInfo.Create(LBitmap.Width, LBitmap.Height, SkFmxColorType[LBitmap.PixelFormat]), LBitmap.Pixels, NativeUInt(LBitmap.Width) * NativeUInt(PixelFormatBytes[LBitmap.PixelFormat]));
-    Result         := FBitmapSurface.Canvas;
+    FBitmapSurface := LBitmap.BeginDraw;
+    if FBitmapSurface = nil then
+      Exit(nil);
+    FBitmapHandle := LBitmap;
+    Result        := FBitmapSurface.Canvas;
   end
   else
     Result := inherited;
+end;
+
+class function TSkCanvasBase.CopyBitmapHandle(const ASource,
+  ADest: TSkBitmapHandle): Boolean;
+begin
+  if ASource = ADest then
+    Exit(True);
+  Result := (ASource.Width = ADest.Width) and (ASource.Height = ADest.Height) and
+    (ASource.PixelFormat = ADest.PixelFormat) and ADest.SetContent(ASource.MakeSnapshot);
+end;
+
+class function TSkCanvasBase.CopyHandleToBitmap(const ASource: THandle;
+  const ADest: FMX.Graphics.TBitmap): Boolean;
+begin
+  if (ASource = 0) or (not ADest.CanvasClass.InheritsFrom(TSkCanvasBase)) then
+    Exit(False);
+  TMonitor.Enter(ADest);
+  try
+    // The content of the destination may be shared with other bitmaps that
+    // were assigned to it.
+    TBitmapAccess(ADest).CopyToNewReference;
+    Result := CopyBitmapHandle(TSkBitmapHandle(ASource), TSkBitmapHandle(ADest.Handle));
+  finally
+    TMonitor.Exit(ADest);
+  end;
 end;
 
 class function TSkCanvasBase.CreateBitmap(const AWidth, AHeight: Integer;
@@ -2716,6 +2957,25 @@ begin
   LParentHandle := WindowHandleToPlatform(Parent);
   if LParentHandle{$IF CompilerVersion < 30}.Form{$ENDIF}.Transparency then
     LParentHandle.CreateBuffer({$IF CompilerVersion < 31}Width, Height{$ELSE}LParentHandle.WndClientSize.Width, LParentHandle.WndClientSize.Height{$ENDIF});
+end;
+
+{$ENDIF}
+
+{$IF CompilerVersion >= 37}
+
+class function TSkCanvasBase.DoCopyImageToBitmap(const ASource: THandle;
+  const ADest: FMX.Graphics.TBitmap): Boolean;
+begin
+  Result := CopyHandleToBitmap(ASource, ADest);
+end;
+
+{$ELSE}
+
+class procedure TSkCanvasBase.DoCopyBitmap(const ASource,
+  ADest: FMX.Graphics.TBitmap);
+begin
+  if not CopyHandleToBitmap(ASource.Handle, ADest) then
+    inherited;
 end;
 
 {$ENDIF}
@@ -2748,17 +3008,17 @@ end;
 class function TSkCanvasBase.DoMapBitmap(const ABitmapHandle: THandle;
   const AAccess: TMapAccess; var ABitmapData: TBitmapData): Boolean;
 var
-  LBitmap: TSkBitmapHandle;
+  LRowBytes: NativeUInt;
 begin
-  LBitmap := TSkBitmapHandle(ABitmapHandle);
-  ABitmapData.Data  := LBitmap.GetPixels(AAccess <> TMapAccess.Write);
-  ABitmapData.Pitch := LBitmap.Width * PixelFormatBytes[LBitmap.PixelFormat];
+  ABitmapData.Data  := TSkBitmapHandle(ABitmapHandle).Map(AAccess, LRowBytes);
+  ABitmapData.Pitch := Integer(LRowBytes);
   Result := True;
 end;
 
 class procedure TSkCanvasBase.DoUnmapBitmap(const ABitmapHandle: THandle;
   var ABitmapData: TBitmapData);
 begin
+  TSkBitmapHandle(ABitmapHandle).Unmap;
 end;
 
 procedure TSkCanvasBase.EndCanvas(const AContextHandle: THandle);
@@ -2778,8 +3038,12 @@ begin
     FSurface := nil;
     SwapBuffers(AContextHandle);
   end
-  else if Bitmap <> nil then
+  else if FBitmapHandle <> nil then
+  begin
     FBitmapSurface := nil;
+    FBitmapHandle.EndDraw;
+    FBitmapHandle := nil;
+  end;
   inherited;
 end;
 
@@ -2850,9 +3114,7 @@ procedure TGrSharedContext.InitializeTextureCache(const ABitmap: TGrBitmapHandle
 var
   LImage: ISkImage;
 begin
-  LImage := TSkImage.MakeFromRaster(
-    TSkImageInfo.Create(ABitmap.Width, ABitmap.Height, SkFmxColorType[ABitmap.PixelFormat]),
-    ABitmap.Pixels, NativeUInt(ABitmap.Width) * NativeUInt(PixelFormatBytes[ABitmap.PixelFormat]));
+  LImage := ABitmap.MakeSnapshot;
   if LImage <> nil then
     ABitmap.Cache := LImage.MakeTextureImage(ABitmap.SharedContext.GrDirectContext);
 end;
@@ -2884,6 +3146,31 @@ begin
       LBitmap := TGrBitmapHandle(Bitmap.Handle);
       if LBitmap.Cache <> nil then
         TGrSharedContext(LBitmap.FSharedContext).FinalizeTextureCache(LBitmap);
+    end;
+  end;
+end;
+
+class function TGrCanvas.CopyBitmapHandle(const ASource,
+  ADest: TSkBitmapHandle): Boolean;
+var
+  LDest: TGrBitmapHandle;
+  LSource: TGrBitmapHandle;
+begin
+  if ASource = ADest then
+    Exit(True);
+  Result := inherited;
+  if Result then
+  begin
+    LSource := TGrBitmapHandle(ASource);
+    LDest   := TGrBitmapHandle(ADest);
+    if LDest.Cache <> nil then
+      TGrSharedContext(LDest.FSharedContext).FinalizeTextureCache(LDest);
+    // Textures are immutable, so the destination can share the one of the
+    // source as well, unless it is still being modified.
+    if (LSource.Cache <> nil) and (not LDest.IsInUse) then
+    begin
+      LDest.FSharedContext := LSource.FSharedContext;
+      LDest.Cache := LSource.Cache;
     end;
   end;
 end;

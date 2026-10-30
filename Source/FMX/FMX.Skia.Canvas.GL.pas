@@ -1078,10 +1078,15 @@ end;
 
 procedure TGlSharedContext.InitializeTextureCache(
   const ABitmap: TGrBitmapHandle);
+var
+  LPixmap: ISkPixmap;
 begin
+  LPixmap := ABitmap.PeekPixels;
+  if LPixmap = nil then
+    Exit;
   BeginContext;
   try
-    ABitmap.Cache := TSkImage.MakeCrossContext(FGrDirectContext, TSkImageInfo.Create(ABitmap.Width, ABitmap.Height, SkFmxColorType[ABitmap.PixelFormat]), ABitmap.Pixels, NativeUInt(ABitmap.Width) * NativeUInt(PixelFormatBytes[ABitmap.PixelFormat]), False);
+    ABitmap.Cache := TSkImage.MakeCrossContext(FGrDirectContext, LPixmap, False);
     FGrDirectContext.Submit(True);
   finally
     EndContext;

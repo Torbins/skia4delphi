@@ -1673,6 +1673,19 @@ begin
   else
     raise ESkBitmapHelper.Create('Invalid pixelformat');
   end;
+  // The bitmaps of the Skia canvases provide an immutable snapshot of their
+  // pixels, which avoids the copy.
+  if CanvasClass.InheritsFrom(TSkCanvasBase) then
+  begin
+    TMonitor.Enter(Self);
+    try
+      Result := TSkBitmapHandle(Handle).MakeSnapshot;
+    finally
+      TMonitor.Exit(Self);
+    end;
+    if Result <> nil then
+      Exit;
+  end;
   if not Map(TMapAccess.Read, LData) then
     raise ESkBitmapHelper.Create('Could not map the bitmap');
   try

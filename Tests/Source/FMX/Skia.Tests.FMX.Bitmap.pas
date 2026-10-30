@@ -36,12 +36,23 @@ type
   private
     function CreateImage(const AImageFileName: string; APreferableWidth, APreferableHeight: Integer): ISkImage;
     procedure DrawChessBackground(ABitmap: TBitmap; ASquareSize: Single; AEvenSquareColor, AOddSquareColor: TAlphaColor);
+    procedure FillBitmap(ABitmap: TBitmap; AColor: TAlphaColor);
+    function GetPixel(ABitmap: TBitmap; AX, AY: Integer): TAlphaColor;
+    procedure SetPixel(ABitmap: TBitmap; AX, AY: Integer; AColor: TAlphaColor);
   public
+    [Test]
+    procedure TestAssignedBitmapIsIndependent;
     [TestCase('1', '50,50,0.98,6XvtB/Tqq7ACCvF/wbz9WfcwAPpFuMAD4RP8fX7iCbSPvwYE+DA59axvb7X39uvfBwZyfJ5+5w')]
     [TestCase('2', '50,40,0.98,8p/9xQDk3zBDCLGj8LntoddP/gYC/I7FAvWzX3/m+befQA8GGBE4+ZXvzvcQBACw//g0OOCA/A')]
     procedure TestBitmapToSkImage(ABitmapWidth, ABitmapHeight: Integer; const AMinSimilarity: Double; const AExpectedImageHash: string);
     [TestCase('1', '50,50,0.98,6XvtB/Tqq7ACCvF/wbz9WfcwAPpFuMAD4RP8fX7iCbSPvwYE+DA59axvb7X39uvfBwZyfJ5+5w')]
     procedure TestBitmapToSkImage2(ABitmapWidth, ABitmapHeight: Integer; const AMinSimilarity: Double; const AExpectedImageHash: string);
+    [Test]
+    procedure TestBitmapToSkImageIsIndependent;
+    [Test]
+    procedure TestCopyFromBitmapIsIndependent;
+    [Test]
+    procedure TestCopyFromBitmapDuringScene;
     [Test]
     procedure TestCreateBitmapFromInvalidSkImage;
     [TestCase('1', '3d-shapes.svg,300,300,0.98,A/zgPwDSq48C+9PTv8T3F6wfxfDVg0H/4viXUTz4DJAwf/vWN+AA+ybwj0ECiptvu/MhEA//8Q')]
@@ -130,6 +141,152 @@ begin
           ABitmap.Canvas.FillRect(TRectF.Create(PointF(X, Y) * ASquareSize, ASquareSize, ASquareSize), 0, 0, [], 1);
   finally
     ABitmap.Canvas.EndScene;
+  end;
+end;
+
+procedure TSkFMXBitmapTests.FillBitmap(ABitmap: TBitmap; AColor: TAlphaColor);
+begin
+  if ABitmap.Canvas.BeginScene then
+  try
+    ABitmap.Canvas.Clear(AColor);
+  finally
+    ABitmap.Canvas.EndScene;
+  end;
+end;
+
+function TSkFMXBitmapTests.GetPixel(ABitmap: TBitmap; AX, AY: Integer): TAlphaColor;
+var
+  LData: TBitmapData;
+begin
+  Assert.IsTrue(ABitmap.Map(TMapAccess.Read, LData));
+  try
+    Result := LData.GetPixel(AX, AY);
+  finally
+    ABitmap.Unmap(LData);
+  end;
+end;
+
+procedure TSkFMXBitmapTests.SetPixel(ABitmap: TBitmap; AX, AY: Integer; AColor: TAlphaColor);
+var
+  LData: TBitmapData;
+begin
+  Assert.IsTrue(ABitmap.Map(TMapAccess.ReadWrite, LData));
+  try
+    LData.SetPixel(AX, AY, AColor);
+  finally
+    ABitmap.Unmap(LData);
+  end;
+end;
+
+procedure TSkFMXBitmapTests.TestAssignedBitmapIsIndependent;
+var
+  LDest: TBitmap;
+  LSource: TBitmap;
+begin
+  LSource := TBitmap.Create(20, 20);
+  try
+    LDest := TBitmap.Create;
+    try
+      FillBitmap(LSource, TAlphaColors.Blue);
+      LDest.Assign(LSource);
+      FillBitmap(LDest, TAlphaColors.Red);
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LSource, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LDest, 5, 5));
+
+      LDest.Assign(LSource);
+      SetPixel(LSource, 5, 5, TAlphaColors.Lime);
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LSource, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
+    finally
+      LDest.Free;
+    end;
+  finally
+    LSource.Free;
+  end;
+end;
+
+procedure TSkFMXBitmapTests.TestBitmapToSkImageIsIndependent;
+var
+  LBitmap: TBitmap;
+  LImage: ISkImage;
+begin
+  LBitmap := TBitmap.Create(20, 20);
+  try
+    FillBitmap(LBitmap, TAlphaColors.Blue);
+    LImage := LBitmap.ToSkImage;
+    FillBitmap(LBitmap, TAlphaColors.Red);
+    Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LBitmap, 5, 5));
+    Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, LImage.PeekPixels.Colors[5, 5]);
+
+    LImage := LBitmap.ToSkImage;
+    SetPixel(LBitmap, 5, 5, TAlphaColors.Lime);
+    Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, LImage.PeekPixels.Colors[5, 5]);
+  finally
+    LBitmap.Free;
+  end;
+end;
+
+procedure TSkFMXBitmapTests.TestCopyFromBitmapDuringScene;
+var
+  LDest: TBitmap;
+  LSource: TBitmap;
+begin
+  LSource := TBitmap.Create(20, 20);
+  try
+    LDest := TBitmap.Create(20, 20);
+    try
+      FillBitmap(LSource, TAlphaColors.Blue);
+      if LDest.Canvas.BeginScene then
+      try
+        LDest.Canvas.Clear(TAlphaColors.Lime);
+        LDest.CopyFromBitmap(LSource);
+        LDest.Canvas.Fill.Kind := TBrushKind.Solid;
+        LDest.Canvas.Fill.Color := TAlphaColors.Red;
+        LDest.Canvas.FillRect(RectF(0, 0, 10, 20), 0, 0, [], 1);
+      finally
+        LDest.Canvas.EndScene;
+      end;
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LDest, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 15, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LSource, 5, 5));
+    finally
+      LDest.Free;
+    end;
+  finally
+    LSource.Free;
+  end;
+end;
+
+procedure TSkFMXBitmapTests.TestCopyFromBitmapIsIndependent;
+var
+  LDest: TBitmap;
+  LSource: TBitmap;
+begin
+  LSource := TBitmap.Create(20, 20);
+  try
+    LDest := TBitmap.Create(20, 20);
+    try
+      FillBitmap(LSource, TAlphaColors.Blue);
+      LDest.CopyFromBitmap(LSource);
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
+
+      FillBitmap(LSource, TAlphaColors.Red);
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LSource, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
+
+      SetPixel(LDest, 5, 5, TAlphaColors.Lime);
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LDest, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LSource, 5, 5));
+
+      LDest.CopyFromBitmap(LSource);
+      SetPixel(LSource, 5, 5, TAlphaColors.Lime);
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LDest, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LSource, 5, 5));
+    finally
+      LDest.Free;
+    end;
+  finally
+    LSource.Free;
   end;
 end;
 

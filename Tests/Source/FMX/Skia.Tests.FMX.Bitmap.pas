@@ -54,6 +54,8 @@ type
     [Test]
     procedure TestCopyFromBitmapDuringScene;
     [Test]
+    procedure TestCopyFromBitmapSharesPixels;
+    [Test]
     procedure TestCreateBitmapFromInvalidSkImage;
     [TestCase('1', '3d-shapes.svg,300,300,0.98,A/zgPwDSq48C+9PTv8T3F6wfxfDVg0H/4viXUTz4DJAwf/vWN+AA+ybwj0ECiptvu/MhEA//8Q')]
     procedure TestCreateBitmapFromSkImage(const AImageFileName: string; ABitmapWidth, ABitmapHeight: Integer; const AMinSimilarity: Double; const AExpectedImageHash: string);
@@ -249,6 +251,27 @@ begin
       Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LDest, 5, 5));
       Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 15, 5));
       Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LSource, 5, 5));
+    finally
+      LDest.Free;
+    end;
+  finally
+    LSource.Free;
+  end;
+end;
+
+procedure TSkFMXBitmapTests.TestCopyFromBitmapSharesPixels;
+var
+  LDest: TBitmap;
+  LSource: TBitmap;
+begin
+  LSource := TBitmap.Create(20, 20);
+  try
+    LDest := TBitmap.Create(20, 20);
+    try
+      FillBitmap(LSource, TAlphaColors.Blue);
+      LDest.CopyFromBitmap(LSource);
+      // Until one of them is modified, the copy uses the pixels of the source.
+      Assert.AreEqual(LSource.ToSkImage.PeekPixels.Pixels, LDest.ToSkImage.PeekPixels.Pixels);
     finally
       LDest.Free;
     end;

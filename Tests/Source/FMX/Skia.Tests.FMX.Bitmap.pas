@@ -50,11 +50,15 @@ type
     [Test]
     procedure TestGpuBitmapDrawnOnRasterBitmap;
     [Test]
-    procedure TestGpuBitmapMapMovesToCpu;
+    procedure TestGpuBitmapMappedForReading;
+    [Test]
+    procedure TestGpuBitmapMappedForWriting;
     [Test]
     procedure TestGpuBitmapMappedWhileDrawn;
     [Test]
     procedure TestGpuBitmapToSkImage;
+    [Test]
+    procedure TestGpuBitmapUsedInThreadWhileContextLocked;
     [Test]
     procedure TestAssignedBitmapIsIndependent;
     [TestCase('1', '50,50,0.98,6XvtB/Tqq7ACCvF/wbz9WfcwAPpFuMAD4RP8fX7iCbSPvwYE+DA59axvb7X39uvfBwZyfJ5+5w')]
@@ -112,6 +116,7 @@ implementation
 uses
   { Delphi }
   System.Classes,
+  System.SyncObjs,
   System.Types,
   System.IOUtils,
   System.Math,
@@ -119,6 +124,12 @@ uses
 
   { Skia }
   FMX.Skia.Canvas;
+
+function HasTexture(ABitmap: TBitmap): Boolean;
+begin
+  Result := (ABitmap.Handle <> 0) and (TObject(ABitmap.Handle) is TGrBitmapHandle) and
+    (TGrBitmapHandle(ABitmap.Handle).Cache <> nil);
+end;
 
 function IsGpuResident(ABitmap: TBitmap): Boolean;
 begin
@@ -253,6 +264,7 @@ begin
     procedure
     var
       LDest: TBitmap;
+      LDrawn: TBitmap;
       LSource: TBitmap;
     begin
       LSource := TBitmap.Create(20, 20);
@@ -261,12 +273,27 @@ begin
         try
           FillBitmap(LSource, TAlphaColors.Blue);
           Assert.IsTrue(IsGpuResident(LSource));
+          // The copy shares the pixels in memory and the texture of the source.
           LDest.CopyFromBitmap(LSource);
-          Assert.IsTrue(IsGpuResident(LDest));
+          Assert.IsTrue(HasTexture(LDest));
 
           FillBitmap(LSource, TAlphaColors.Red);
           Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
           Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LSource, 5, 5));
+          // Its texture was not modified with the source either.
+          LDrawn := TBitmap.Create(20, 20);
+          try
+            if LDrawn.Canvas.BeginScene then
+            try
+              LDrawn.Canvas.DrawBitmap(LDest, RectF(0, 0, 20, 20), RectF(0, 0, 20, 20), 1, True);
+            finally
+              LDrawn.Canvas.EndScene;
+            end;
+            Assert.IsTrue(IsGpuResident(LDrawn));
+            Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDrawn, 5, 5));
+          finally
+            LDrawn.Free;
+          end;
 
           LDest.Assign(LSource);
           FillBitmap(LDest, TAlphaColors.Lime);
@@ -353,7 +380,7 @@ begin
   end;
 end;
 
-procedure TSkFMXBitmapTests.TestGpuBitmapMapMovesToCpu;
+procedure TSkFMXBitmapTests.TestGpuBitmapMappedForReading;
 begin
   RunGpuBitmapTest(
     procedure
@@ -364,9 +391,34 @@ begin
       try
         FillBitmap(LBitmap, TAlphaColors.Blue);
         Assert.IsTrue(IsGpuResident(LBitmap));
+        // The pixels were read back at the end of the scene.
         Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LBitmap, 5, 5));
+        Assert.IsTrue(IsGpuResident(LBitmap));
+        FillBitmap(LBitmap, TAlphaColors.Red);
+        Assert.IsTrue(IsGpuResident(LBitmap));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LBitmap, 5, 5));
+      finally
+        LBitmap.Free;
+      end;
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapMappedForWriting;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LBitmap: TBitmap;
+    begin
+      LBitmap := TBitmap.Create(20, 20);
+      try
+        FillBitmap(LBitmap, TAlphaColors.Blue);
+        Assert.IsTrue(IsGpuResident(LBitmap));
+        SetPixel(LBitmap, 5, 5, TAlphaColors.Lime);
         Assert.IsFalse(IsGpuResident(LBitmap));
-        // Once its pixels were accessed from the CPU, it stays in memory.
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LBitmap, 5, 5));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LBitmap, 2, 2));
+        // Once its pixels were modified directly, it is drawn in memory.
         FillBitmap(LBitmap, TAlphaColors.Red);
         Assert.IsFalse(IsGpuResident(LBitmap));
         Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LBitmap, 5, 5));
@@ -421,6 +473,90 @@ begin
         LImage := LBitmap.ToSkImage;
         Assert.IsFalse(LImage.IsTextureBacked);
         Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, LImage.PeekPixels.Colors[5, 5]);
+        Assert.IsTrue(IsGpuResident(LBitmap));
+      finally
+        LBitmap.Free;
+      end;
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapUsedInThreadWhileContextLocked;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LBitmap: TBitmap;
+      LCopy: TBitmap;
+      LCopyColor: TAlphaColor;
+      LDone: TEvent;
+      LDrawn: TBitmap;
+      LDrawnColor: TAlphaColor;
+      LError: string;
+      LImageColor: TAlphaColor;
+      LWaitResult: TWaitResult;
+    begin
+      LBitmap := TBitmap.Create(20, 20);
+      try
+        LCopy := TBitmap.Create(20, 20);
+        try
+          LDrawn := TBitmap.Create(20, 20);
+          try
+            FillBitmap(LBitmap, TAlphaColors.Blue);
+            Assert.IsTrue(IsGpuResident(LBitmap));
+            LDone := TEvent.Create;
+            try
+              // The main thread keeps the shared context locked while it draws
+              // a window, so the bitmap must be usable in other threads
+              // meanwhile. Otherwise they would wait for the main thread while
+              // holding the lock of the bitmap, which the window may need.
+              TGrCanvas.SharedContext.BeginContext;
+              try
+                TThread.CreateAnonymousThread(
+                  procedure
+                  begin
+                    try
+                      try
+                        LImageColor := LBitmap.ToSkImage.PeekPixels.Colors[5, 5];
+                        LCopy.CopyFromBitmap(LBitmap);
+                        LCopyColor := GetPixel(LCopy, 5, 5);
+                        if LDrawn.Canvas.BeginScene then
+                        try
+                          LDrawn.Canvas.DrawBitmap(LBitmap, RectF(0, 0, 20, 20), RectF(0, 0, 20, 20), 1, True);
+                        finally
+                          LDrawn.Canvas.EndScene;
+                        end;
+                        LDrawnColor := GetPixel(LDrawn, 5, 5);
+                        SetPixel(LBitmap, 5, 5, TAlphaColors.Lime);
+                      except
+                        on E: Exception do
+                          LError := E.ClassName + ': ' + E.Message;
+                      end;
+                    finally
+                      LDone.SetEvent;
+                    end;
+                  end).Start;
+                LWaitResult := LDone.WaitFor(10000);
+              finally
+                TGrCanvas.SharedContext.EndContext;
+              end;
+              // Waits for the thread in case it was blocked by the context.
+              LDone.WaitFor(INFINITE);
+            finally
+              LDone.Free;
+            end;
+            Assert.AreEqual(TWaitResult.wrSignaled, LWaitResult, 'The thread waited for the shared context.');
+            Assert.AreEqual('', LError);
+            Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, LImageColor);
+            Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, LCopyColor);
+            Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, LDrawnColor);
+            Assert.IsFalse(IsGpuResident(LBitmap));
+            Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LBitmap, 5, 5));
+          finally
+            LDrawn.Free;
+          end;
+        finally
+          LCopy.Free;
+        end;
       finally
         LBitmap.Free;
       end;

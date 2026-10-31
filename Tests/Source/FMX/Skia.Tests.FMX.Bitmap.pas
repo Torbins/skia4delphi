@@ -39,7 +39,22 @@ type
     procedure FillBitmap(ABitmap: TBitmap; AColor: TAlphaColor);
     function GetPixel(ABitmap: TBitmap; AX, AY: Integer): TAlphaColor;
     procedure SetPixel(ABitmap: TBitmap; AX, AY: Integer; AColor: TAlphaColor);
+    // Bitmaps only move to the GPU when drawn in the main thread, while the
+    // tests run in another thread.
+    procedure RunGpuBitmapTest(const AProc: TProc);
   public
+    [Test]
+    procedure TestGpuBitmapCopy;
+    [Test]
+    procedure TestGpuBitmapDrawnOnBitmap;
+    [Test]
+    procedure TestGpuBitmapDrawnOnRasterBitmap;
+    [Test]
+    procedure TestGpuBitmapMapMovesToCpu;
+    [Test]
+    procedure TestGpuBitmapMappedWhileDrawn;
+    [Test]
+    procedure TestGpuBitmapToSkImage;
     [Test]
     procedure TestAssignedBitmapIsIndependent;
     [TestCase('1', '50,50,0.98,6XvtB/Tqq7ACCvF/wbz9WfcwAPpFuMAD4RP8fX7iCbSPvwYE+DA59axvb7X39uvfBwZyfJ5+5w')]
@@ -96,10 +111,49 @@ implementation
 
 uses
   { Delphi }
+  System.Classes,
   System.Types,
   System.IOUtils,
   System.Math,
-  System.Math.Vectors;
+  System.Math.Vectors,
+
+  { Skia }
+  FMX.Skia.Canvas;
+
+function IsGpuResident(ABitmap: TBitmap): Boolean;
+begin
+  Result := (ABitmap.Handle <> 0) and (TObject(ABitmap.Handle) is TGrBitmapHandle) and
+    TGrBitmapHandle(ABitmap.Handle).IsGpuResident;
+end;
+
+function SupportsGpuBitmaps(out AReason: string): Boolean;
+const
+  BackendNames: array[TGrBackendAPI] of string = ('OpenGL', 'Vulkan', 'Metal');
+var
+  LBackend: TGrBackendAPI;
+begin
+  Result := False;
+  if not GlobalSkiaGpuBitmaps then
+    AReason := 'GlobalSkiaGpuBitmaps is disabled.'
+  else if DefaultSkiaRenderCanvasClass = nil then
+    AReason := 'The Skia canvas is not in use.'
+  else if not DefaultSkiaRenderCanvasClass.InheritsFrom(TGrCanvas) then
+    AReason := Format('The canvas %s does not use the GPU.', [DefaultSkiaRenderCanvasClass.ClassName])
+  else if not TGrCanvas.Initialized or (TGrCanvas.SharedContext = nil) then
+    AReason := 'The GPU shared context was not created.'
+  else
+  begin
+    TGrCanvas.SharedContext.BeginContext;
+    try
+      LBackend := TGrCanvas.SharedContext.GrDirectContext.BackendAPI;
+    finally
+      TGrCanvas.SharedContext.EndContext;
+    end;
+    Result := LBackend in [TGrBackendAPI.Vulkan, TGrBackendAPI.Metal];
+    if not Result then
+      AReason := Format('GPU bitmaps require Metal or Vulkan, but the canvas uses %s.', [BackendNames[LBackend]]);
+  end;
+end;
 
 { TSkFMXBitmapTests }
 
@@ -178,6 +232,199 @@ begin
   finally
     ABitmap.Unmap(LData);
   end;
+end;
+
+procedure TSkFMXBitmapTests.RunGpuBitmapTest(const AProc: TProc);
+var
+  LReason: string;
+begin
+  if not SupportsGpuBitmaps(LReason) then
+    Assert.Pass(LReason);
+  TThread.Synchronize(nil,
+    procedure
+    begin
+      AProc();
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapCopy;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LDest: TBitmap;
+      LSource: TBitmap;
+    begin
+      LSource := TBitmap.Create(20, 20);
+      try
+        LDest := TBitmap.Create(20, 20);
+        try
+          FillBitmap(LSource, TAlphaColors.Blue);
+          Assert.IsTrue(IsGpuResident(LSource));
+          LDest.CopyFromBitmap(LSource);
+          Assert.IsTrue(IsGpuResident(LDest));
+
+          FillBitmap(LSource, TAlphaColors.Red);
+          Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
+          Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LSource, 5, 5));
+
+          LDest.Assign(LSource);
+          FillBitmap(LDest, TAlphaColors.Lime);
+          Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LDest, 5, 5));
+          Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LSource, 5, 5));
+        finally
+          LDest.Free;
+        end;
+      finally
+        LSource.Free;
+      end;
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapDrawnOnBitmap;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LDest: TBitmap;
+      LSource: TBitmap;
+    begin
+      LSource := TBitmap.Create(20, 20);
+      try
+        LDest := TBitmap.Create(20, 20);
+        try
+          FillBitmap(LSource, TAlphaColors.Blue);
+          if LDest.Canvas.BeginScene then
+          try
+            LDest.Canvas.Clear(TAlphaColors.Lime);
+            LDest.Canvas.DrawBitmap(LSource, RectF(0, 0, 20, 20), RectF(0, 0, 10, 20), 1, True);
+          finally
+            LDest.Canvas.EndScene;
+          end;
+          // The source was drawn as a texture, without moving to memory.
+          Assert.IsTrue(IsGpuResident(LSource));
+          Assert.IsTrue(IsGpuResident(LDest));
+          Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
+          Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LDest, 15, 5));
+        finally
+          LDest.Free;
+        end;
+      finally
+        LSource.Free;
+      end;
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapDrawnOnRasterBitmap;
+var
+  LDest: TBitmap;
+  LReason: string;
+  LSource: TBitmap;
+begin
+  if not SupportsGpuBitmaps(LReason) then
+    Assert.Pass(LReason);
+  LSource := TBitmap.Create(20, 20);
+  try
+    LDest := TBitmap.Create(20, 20);
+    try
+      TThread.Synchronize(nil,
+        procedure
+        begin
+          FillBitmap(LSource, TAlphaColors.Blue);
+          Assert.IsTrue(IsGpuResident(LSource));
+        end);
+      // Drawn outside the main thread, the destination stays in memory, so the
+      // source must be drawn from memory too.
+      if LDest.Canvas.BeginScene then
+      try
+        LDest.Canvas.Clear(TAlphaColors.Lime);
+        LDest.Canvas.DrawBitmap(LSource, RectF(0, 0, 20, 20), RectF(0, 0, 10, 20), 1, True);
+      finally
+        LDest.Canvas.EndScene;
+      end;
+      Assert.IsFalse(IsGpuResident(LDest));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LDest, 5, 5));
+      Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LDest, 15, 5));
+    finally
+      LDest.Free;
+    end;
+  finally
+    LSource.Free;
+  end;
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapMapMovesToCpu;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LBitmap: TBitmap;
+    begin
+      LBitmap := TBitmap.Create(20, 20);
+      try
+        FillBitmap(LBitmap, TAlphaColors.Blue);
+        Assert.IsTrue(IsGpuResident(LBitmap));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LBitmap, 5, 5));
+        Assert.IsFalse(IsGpuResident(LBitmap));
+        // Once its pixels were accessed from the CPU, it stays in memory.
+        FillBitmap(LBitmap, TAlphaColors.Red);
+        Assert.IsFalse(IsGpuResident(LBitmap));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LBitmap, 5, 5));
+      finally
+        LBitmap.Free;
+      end;
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapMappedWhileDrawn;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LBitmap: TBitmap;
+    begin
+      LBitmap := TBitmap.Create(20, 20);
+      try
+        if LBitmap.Canvas.BeginScene then
+        try
+          LBitmap.Canvas.Clear(TAlphaColors.Blue);
+          Assert.IsTrue(IsGpuResident(LBitmap));
+          SetPixel(LBitmap, 5, 5, TAlphaColors.Lime);
+          LBitmap.Canvas.Fill.Kind := TBrushKind.Solid;
+          LBitmap.Canvas.Fill.Color := TAlphaColors.Red;
+          LBitmap.Canvas.FillRect(RectF(10, 0, 20, 20), 0, 0, [], 1);
+        finally
+          LBitmap.Canvas.EndScene;
+        end;
+        Assert.IsTrue(IsGpuResident(LBitmap));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Lime, GetPixel(LBitmap, 5, 5));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, GetPixel(LBitmap, 2, 2));
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Red, GetPixel(LBitmap, 15, 5));
+      finally
+        LBitmap.Free;
+      end;
+    end);
+end;
+
+procedure TSkFMXBitmapTests.TestGpuBitmapToSkImage;
+begin
+  RunGpuBitmapTest(
+    procedure
+    var
+      LBitmap: TBitmap;
+      LImage: ISkImage;
+    begin
+      LBitmap := TBitmap.Create(20, 20);
+      try
+        FillBitmap(LBitmap, TAlphaColors.Blue);
+        Assert.IsTrue(IsGpuResident(LBitmap));
+        LImage := LBitmap.ToSkImage;
+        Assert.IsFalse(LImage.IsTextureBacked);
+        Assert.AreEqual<TAlphaColor>(TAlphaColors.Blue, LImage.PeekPixels.Colors[5, 5]);
+      finally
+        LBitmap.Free;
+      end;
+    end);
 end;
 
 procedure TSkFMXBitmapTests.TestAssignedBitmapIsIndependent;

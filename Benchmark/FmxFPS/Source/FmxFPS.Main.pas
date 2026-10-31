@@ -43,16 +43,23 @@ type
     FCIMode: Boolean;
     FCIOutputFileName: string;
     FDiagnostics: IBenchmarkDiagnostics;
+    FDurationMilliseconds: Int64;
     FNextScrollUp: Boolean;
     FRunning: Boolean;
+    FUncapped: Boolean;
+    FUncappedFrame: Integer;
     function CreateControl(const AControlNumber, ATotalOfControls: Integer): TControl;
+    procedure Finish;
     function GetRenderName: string;
     class procedure ShowMessage(const AMessage: string; const ACloseDialogProc: TProc = nil); static;
     procedure SimulateScrollDown;
     procedure SimulateScrollUp;
+    procedure UncappedIdle(Sender: TObject; var ADone: Boolean);
     procedure WriteCIResult;
   protected
     procedure DoPaint(const ACanvas: TCanvas; const ARect: TRectF); override;
+  public
+    procedure PaintRects(const UpdateRects: array of TRectF); override;
   end;
 
 var
@@ -72,12 +79,35 @@ uses
   {$IF CompilerVersion >= 31}
   FMX.DialogService,
   {$ENDIF}
-  System.IOUtils, System.JSON, FMX.Types3D;
+  System.IOUtils, System.JSON, System.Math, System.Diagnostics, FMX.Types3D;
 
 const
   BenchmarkControlsCount = 750;
   BenchmarkDurationMilliseconds = 6000;
   BenchmarkTotalScrollHeight = 5000;
+  /// <summary>How far the uncapped mode scrolls on each frame, in logical pixels.</summary>
+  UncappedScrollStep = 24;
+  /// <summary>
+  ///   Frames the uncapped mode paints before it starts measuring: enough to go once through the whole content,
+  ///   so that every glyph, texture and cached effect has been created at least once.
+  /// </summary>
+  UncappedWarmUpFrames = 240;
+
+/// <summary>The duration of the measurement, which can be changed with <c>-duration=&lt;seconds&gt;</c>.</summary>
+function BenchmarkDuration: Int64;
+var
+  LSeconds: Integer;
+  LValue: string;
+begin
+  Result := BenchmarkDurationMilliseconds;
+  if (FindCmdLineSwitch('duration', LValue) or FindCmdLineSwitch('-duration', LValue)) and not LValue.IsEmpty then
+  begin
+    if LValue.StartsWith('=') then
+      LValue := LValue.Substring(1);
+    if TryStrToInt(LValue, LSeconds) and (LSeconds > 0) then
+      Result := Int64(LSeconds) * MSecsPerSec;
+  end;
+end;
 
 function BenchmarkCIOutputFileName: string;
 var
@@ -261,7 +291,7 @@ begin
   if FRunning then
   begin
     FDiagnostics.RecordFrame;
-    if FDiagnostics.PaintCount = 1 then
+    if (FDiagnostics.PaintCount = 1) and not FUncapped then
     begin
       {$IF CompilerVersion < 29}
       vsbContent.ViewportPosition := PointF(0, vsbContent.ContentBounds.Height * 0.3);
@@ -285,6 +315,8 @@ var
 begin
   FDiagnostics := CreateBenchmarkDiagnostics;
   FCIMode := FindCmdLineSwitch('ci', True) or FindCmdLineSwitch('-ci', True);
+  FUncapped := FindCmdLineSwitch('uncapped', True) or FindCmdLineSwitch('-uncapped', True);
+  FDurationMilliseconds := BenchmarkDuration;
   if FCIMode then
     FCIOutputFileName := BenchmarkCIOutputFileName;
   for I := 0 to BenchmarkControlsCount - 1 do
@@ -307,6 +339,38 @@ begin
       begin
         frmMain.tmrStart.Enabled := True;
       end);
+end;
+
+procedure TfrmMain.Finish;
+begin
+  FRunning := False;
+  FDiagnostics.Stop;
+  tmrSimulateScroll.Enabled := False;
+  vsbContent.HitTest := True;
+  if FCIMode then
+  begin
+    try
+      WriteCIResult;
+      System.ExitCode := 0;
+    except
+      System.ExitCode := 2;
+    end;
+    Application.Terminate;
+    Exit;
+  end;
+  {$IFDEF SKIA}
+  if GlobalUseSkia then
+  begin
+    ShowMessage(Format('Skia render (%s)' + sLineBreak + 'Form.Quality: %s' + sLineBreak + '%s' +
+      sLineBreak + sLineBreak +
+      'To compare the results with the firemonkey''s default canvas, just remove the line "GlobalUseSkia := True" ' +
+      'from the .dpr file of project.', [GetRenderName,
+      GetEnumName(TypeInfo(TCanvasQuality), Ord(Self.Quality)), FDiagnostics.Summary]))
+  end
+  else
+  {$ENDIF}
+    ShowMessage(Format('FMX render (%s)' + sLineBreak + 'Form.Quality: %s' + sLineBreak + '%s',
+      [GetRenderName, GetEnumName(TypeInfo(TCanvasQuality), Ord(Self.Quality)), FDiagnostics.Summary]));
 end;
 
 function TfrmMain.GetRenderName: string;
@@ -482,44 +546,60 @@ begin
   {$ENDIF}
 end;
 
+procedure TfrmMain.PaintRects(const UpdateRects: array of TRectF);
+var
+  LStart: Int64;
+begin
+  LStart := TStopwatch.GetTimeStamp;
+  inherited;
+  if FRunning then
+    FDiagnostics.RecordPaint(((TStopwatch.GetTimeStamp - LStart) * MSecsPerSec) / TStopwatch.Frequency);
+end;
+
 procedure TfrmMain.tmrSimulateScrollTimer(Sender: TObject);
 begin
-  if FDiagnostics.ElapsedMilliseconds > BenchmarkDurationMilliseconds then
-  begin
-    FRunning := False;
-    FDiagnostics.Stop;
-    tmrSimulateScroll.Enabled := False;
-    vsbContent.HitTest := True;
-    if FCIMode then
-    begin
-      try
-        WriteCIResult;
-        System.ExitCode := 0;
-      except
-        System.ExitCode := 2;
-      end;
-      Application.Terminate;
-      Exit;
-    end;
-    {$IFDEF SKIA}
-    if GlobalUseSkia then
-    begin
-      ShowMessage(Format('Skia render (%s)' + sLineBreak + 'Form.Quality: %s' + sLineBreak + '%s' +
-        sLineBreak + sLineBreak +
-        'To compare the results with the firemonkey''s default canvas, just remove the line "GlobalUseSkia := True" ' +
-        'from the .dpr file of project.', [GetRenderName,
-        GetEnumName(TypeInfo(TCanvasQuality), Ord(Self.Quality)), FDiagnostics.Summary]))
-    end
-    else
-    {$ENDIF}
-      ShowMessage(Format('FMX render (%s)' + sLineBreak + 'Form.Quality: %s' + sLineBreak + '%s',
-        [GetRenderName, GetEnumName(TypeInfo(TCanvasQuality), Ord(Self.Quality)), FDiagnostics.Summary]));
-  end
+  if FDiagnostics.ElapsedMilliseconds > FDurationMilliseconds then
+    Finish
   else if FNextScrollUp then
     SimulateScrollUp
   else
     SimulateScrollDown;
   FNextScrollUp := not FNextScrollUp;
+end;
+
+/// <summary>
+///   Drives the uncapped mode. Instead of flinging the scroll box and letting the animation pace the frames to
+///   the display, every idle moves the content by a fixed step and asks for the next frame at once. Frames are
+///   then painted back to back, and the frame rate measures how fast the renderer is rather than how fast the
+///   display is. The positions only depend on the frame number, so every build paints exactly the same frames.
+/// </summary>
+procedure TfrmMain.UncappedIdle(Sender: TObject; var ADone: Boolean);
+var
+  LMaxPosition: Single;
+  LPosition: Single;
+begin
+  if not FRunning then
+    Exit;
+  if FDiagnostics.ElapsedMilliseconds > FDurationMilliseconds then
+  begin
+    // Finished from a timer, as in the scroll mode: on Windows, the application only quits after it has handled
+    // a message, so terminating it from here would leave it waiting for one.
+    Application.OnIdle := nil;
+    tmrSimulateScroll.Interval := 1;
+    tmrSimulateScroll.Enabled := True;
+    Exit;
+  end;
+  ADone := False;
+  if FUncappedFrame = UncappedWarmUpFrames then
+    FDiagnostics.Start;
+  LMaxPosition := Max(Single(1), vsbContent.ContentBounds.Height - vsbContent.Height);
+  LPosition := FUncappedFrame * UncappedScrollStep;
+  LPosition := LPosition - Trunc(LPosition / (2 * LMaxPosition)) * (2 * LMaxPosition);
+  if LPosition > LMaxPosition then
+    LPosition := 2 * LMaxPosition - LPosition;
+  Inc(FUncappedFrame);
+  vsbContent.ViewportPosition := PointF(0, LPosition);
+  Invalidate;
 end;
 
 procedure TfrmMain.WriteCIResult;
@@ -541,6 +621,10 @@ begin
     LRootObject.AddPair('renderer', LRenderer);
     LRootObject.AddPair('canvas', GetRenderName);
     LRootObject.AddPair('quality', GetEnumName(TypeInfo(TCanvasQuality), Ord(Self.Quality)));
+    if FUncapped then
+      LRootObject.AddPair('mode', 'uncapped')
+    else
+      LRootObject.AddPair('mode', 'scroll');
     FDiagnostics.WriteTo(LRootObject);
     LRootObject.AddPair('controls', TJSONNumber.Create(BenchmarkControlsCount));
     LRootObject.AddPair('scroll_height', TJSONNumber.Create(BenchmarkTotalScrollHeight));
@@ -557,8 +641,17 @@ procedure TfrmMain.tmrStartTimer(Sender: TObject);
 begin
   tmrStart.Enabled := False;
   FRunning := True;
-  FDiagnostics.Start;
-  Invalidate;
+  if FUncapped then
+  begin
+    // The measurement starts once the warm up frames have been painted
+    FUncappedFrame := 0;
+    Application.OnIdle := UncappedIdle;
+  end
+  else
+  begin
+    FDiagnostics.Start;
+    Invalidate;
+  end;
 end;
 
 { TVertScrollBox }

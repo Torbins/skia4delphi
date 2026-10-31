@@ -33,6 +33,12 @@ type
     function GetPaintCount: Int64;
     /// <summary>Call once per painted frame. The timed window starts at the first call.</summary>
     procedure RecordFrame;
+    /// <summary>
+    ///   Call once per painted frame with the time the form spent painting it, from the start of the scene to the
+    ///   end of the presentation. Unlike the frame rate, this does not saturate at the display refresh rate, so
+    ///   it still tells two renderers apart when both keep up with the display.
+    /// </summary>
+    procedure RecordPaint(const AMilliseconds: Double);
     /// <summary>Discards anything measured so far and arms the measurement.</summary>
     procedure Start;
     /// <summary>Stops measuring. Anything happening after this is not counted.</summary>
@@ -95,6 +101,7 @@ type
   TBenchmarkDiagnostics = class(TInterfacedObject, IBenchmarkDiagnostics)
   private
     FFrames: TIntervalSeries;
+    FPaints: TIntervalSeries;
     FPaintCount: Int64;
     FRunning: Boolean;
     FStopwatch: TStopwatch;
@@ -117,6 +124,7 @@ type
     function GetElapsedMilliseconds: Int64;
     function GetPaintCount: Int64;
     procedure RecordFrame;
+    procedure RecordPaint(const AMilliseconds: Double);
     procedure Start;
     procedure Stop;
     function Summary: string;
@@ -301,6 +309,7 @@ end;
 procedure TBenchmarkDiagnostics.Start;
 begin
   FFrames.Reset;
+  FPaints.Reset;
   FPaintCount := 0;
   FStopwatch := TStopwatch.Create;
   FRunning := True;
@@ -338,6 +347,12 @@ begin
   FFrames.AddElapsed;
 end;
 
+procedure TBenchmarkDiagnostics.RecordPaint(const AMilliseconds: Double);
+begin
+  if FRunning and (FPaintCount > 0) then
+    FPaints.Add(AMilliseconds);
+end;
+
 function TBenchmarkDiagnostics.Summary: string;
 begin
   Result := Format('%g fps', [FramesPerSecond]);
@@ -345,6 +360,9 @@ begin
     Exit;
   Result := Result + Format(sLineBreak + 'frame ms: median %.1f, p95 %.1f, p99 %.1f, max %.1f, jitter %.1f',
     [FFrames.Median, FFrames.P95, FFrames.P99, FFrames.Max, FFrames.Jitter]);
+  if FPaints.Count > 0 then
+    Result := Result + Format(sLineBreak + 'paint ms: mean %.2f, median %.2f, p95 %.2f, p99 %.2f',
+      [FPaints.Mean, FPaints.Median, FPaints.P95, FPaints.P99]);
   if HasTicks then
     Result := Result + Format(sLineBreak + 'display link: %.1f ticks/s, jitter %.1f ms',
       [TicksPerSecond, {$IF CompilerVersion >= 37}FTicks.Jitter{$ELSE}0{$ENDIF}]);
@@ -365,6 +383,13 @@ begin
   ARootObject.AddPair('frame_ms_p99', TJSONNumber.Create(FFrames.P99));
   ARootObject.AddPair('frame_ms_max', TJSONNumber.Create(FFrames.Max));
   ARootObject.AddPair('frame_ms_jitter', TJSONNumber.Create(FFrames.Jitter));
+  if FPaints.Count > 0 then
+  begin
+    ARootObject.AddPair('paint_ms_mean', TJSONNumber.Create(FPaints.Mean));
+    ARootObject.AddPair('paint_ms_median', TJSONNumber.Create(FPaints.Median));
+    ARootObject.AddPair('paint_ms_p95', TJSONNumber.Create(FPaints.P95));
+    ARootObject.AddPair('paint_ms_p99', TJSONNumber.Create(FPaints.P99));
+  end;
   {$IF CompilerVersion >= 37}
   if HasTicks then
   begin

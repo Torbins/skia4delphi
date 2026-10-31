@@ -576,6 +576,19 @@ contains `renderer`, `canvas`, `quality`, `fps`, `paint_count`,
 measurement was written; exit code `2` means report writing failed. Exit code
 `0` does not mean the FPS is acceptable.
 
+The default `scroll` mode flings the scroll box and lets the FMX animation pace
+the frames. Since RAD Studio 13 that animation follows the display refresh, so
+`fps` saturates at the refresh rate as soon as a frame fits in one refresh
+period, and two renderers that both keep up report the same value. Compare them
+with the `paint_ms_*` fields instead: the time the form spent painting each
+frame, from the start of the scene to the end of its presentation, which does
+not saturate. Two more switches help comparisons:
+
+| Option | Meaning |
+| --- | --- |
+| `--uncapped` | Paints frames back to back at fixed scroll positions instead of flinging the scroll box. `fps` then measures the renderer, not the display, and every build paints exactly the same frames. The first 240 frames are a warm-up that is not measured. The report has `"mode": "uncapped"`. |
+| `--duration=<seconds>` | Measures for the given whole number of seconds instead of six. |
+
 For a meaningful comparison:
 
 - build baseline and candidate with the same RAD Studio version,

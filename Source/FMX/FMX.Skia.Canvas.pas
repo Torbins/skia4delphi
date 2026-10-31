@@ -201,16 +201,10 @@ type
     constructor Create(const AWidth, AHeight: Integer; const APixelFormat: TPixelFormat);
     destructor Destroy; override;
     /// <summary>
-    ///   Returns an immutable image of the current content without copying
-    ///   the pixels, or nil when the bitmap has no pixels. The image is backed
-    ///   by a GPU texture when the bitmap is.
+    ///   Returns an immutable image in memory of the current content without
+    ///   copying the pixels, or nil when the bitmap has no pixels.
     /// </summary>
     function MakeSnapshot: ISkImage; virtual;
-    /// <summary>
-    ///   Same as <b>MakeSnapshot</b>, but the image is always in memory, so it
-    ///   can be drawn on any canvas and its pixels can be read.
-    /// </summary>
-    function MakeRasterSnapshot: ISkImage; virtual;
     /// <summary>
     ///   Returns the pixels for reading only, or nil when the bitmap has no
     ///   pixels. They may be shared with other bitmaps and images.
@@ -310,7 +304,15 @@ type
 
   TGrSharedContext = class abstract(TInterfacedObject, IGrSharedContext)
   strict private
+    // GPU objects released while the context was locked by another thread.
+    FPendingReleases: TArray<IInterface>;
+    FPendingReleasesLock: TObject;
     function GetGrDirectContext: TGrDirectContext;
+    procedure ReleasePendingObjects;
+  private
+    procedure ReleaseObject(var AObject: IInterface);
+    function TryLock: Boolean;
+    procedure Unlock;
   strict protected
     FGrDirectContext: IGrDirectContext;
     procedure BeginContext; virtual;
@@ -332,46 +334,46 @@ type
   /// <summary>
   ///   Pixels of a bitmap of the GPU canvases. With Metal and Vulkan, whose
   ///   windows draw with the shared context, a bitmap drawn through its canvas
-  ///   in the main thread moves to a GPU surface of the shared context, so it
-  ///   is drawn on the windows without being uploaded. Accessing its pixels
-  ///   from the CPU moves it back to memory, where it stays.
+  ///   in the main thread is drawn on a GPU surface of the shared context,
+  ///   which is kept to draw the bitmap on the windows without uploading it.
+  ///   The pixels are read back to memory at the end of each scene, so other
+  ///   threads never need the shared context, which the main thread keeps
+  ///   locked while it draws a window.
   /// </summary>
   TGrBitmapHandle = class(TSkBitmapHandle)
   private
     FSharedContext: IGrSharedContext;
     function BeginDraw: ISkSurface; override;
     procedure EndDraw; override;
-    function GetSurface: ISkSurface; override;
-    function HasGpuContent: Boolean; inline;
     function IsDrawnOnGpu: Boolean; inline;
+    function MakeGpuSnapshot: ISkImage;
     function Map(const AAccess: TMapAccess; out ARowBytes: NativeUInt): Pointer; override;
     function SetContent(const AImage: ISkImage): Boolean; override;
     procedure Unmap; override;
   strict private
     FCache: ISkImage;
-    // Prevents the bitmap from moving to the GPU again after its pixels have
-    // been accessed from the CPU.
+    // Prevents the bitmap from being drawn on the GPU again after its pixels
+    // have been modified directly.
     FCpuPreferred: Boolean;
     FGpuDrawCount: Integer;
-    // Content shared with another handle, backed by a texture of the shared
-    // context. It is only used when there is no surface.
-    FGpuImage: ISkImage;
+    // Indicates that the content in memory has changed since the GPU surface
+    // was updated. Any thread can set it, while the GPU surface itself is only
+    // used with the shared context locked.
+    FGpuOutdated: Boolean;
     FGpuSurface: ISkSurface;
     // Copy of the GPU surface in memory, mapped while it is being drawn.
     FMapSurface: ISkSurface;
-    function CanMoveToGpu: Boolean;
-    function MoveToCpu: Boolean;
-    function MoveToGpu: Boolean;
+    function CanDrawOnGpu: Boolean;
     function ReadGpuPixels: ISkSurface;
-    procedure ReleaseGpuContent;
+    procedure ReleaseGpuSurface;
+    function UpdateGpuSurface: Boolean;
   public
     destructor Destroy; override;
-    function MakeRasterSnapshot: ISkImage; override;
     function MakeSnapshot: ISkImage; override;
     function PeekPixels: ISkPixmap; override;
     /// <summary>
-    ///   Indicates whether the pixels are in a GPU surface instead of in
-    ///   memory.
+    ///   Indicates whether the content is also in a GPU surface, from which
+    ///   the bitmap is drawn on the windows without being uploaded.
     /// </summary>
     function IsGpuResident: Boolean;
   public
@@ -1915,7 +1917,7 @@ begin
     Exit(nil);
   TMonitor.Enter(ABitmap);
   try
-    Result := TSkBitmapHandle(ABitmap.Handle).MakeRasterSnapshot;
+    Result := TSkBitmapHandle(ABitmap.Handle).MakeSnapshot;
   finally
     TMonitor.Exit(ABitmap);
   end;
@@ -2817,11 +2819,6 @@ begin
   Result := (FDrawCount > 0) or (FMapCount > 0);
 end;
 
-function TSkBitmapHandle.MakeRasterSnapshot: ISkImage;
-begin
-  Result := MakeSnapshot;
-end;
-
 function TSkBitmapHandle.MakeSnapshot: ISkImage;
 begin
   if FSurface = nil then
@@ -3111,23 +3108,27 @@ end;
 procedure TGrSharedContext.BeginContext;
 begin
   TMonitor.Enter(Self);
+  ReleasePendingObjects;
 end;
 
 constructor TGrSharedContext.Create;
 begin
   inherited;
+  FPendingReleasesLock := TObject.Create;
   SkInitialize;
 end;
 
 destructor TGrSharedContext.Destroy;
 begin
   TThread.Synchronize(nil, DestroyContext);
+  FPendingReleasesLock.Free;
   SkFinalize;
   inherited;
 end;
 
 procedure TGrSharedContext.DestroyContext;
 begin
+  ReleasePendingObjects;
   TMessageManager.DefaultManager.SendMessage(TGrDirectContext(FGrDirectContext), TGrBeforeSharedContextDestructionMessage.Create);
   FGrDirectContext.AbandonContext;
   FGrDirectContext := nil;
@@ -3139,8 +3140,12 @@ begin
 end;
 
 procedure TGrSharedContext.FinalizeTextureCache(const ABitmap: TGrBitmapHandle);
+var
+  LCache: IInterface;
 begin
+  LCache := ABitmap.Cache;
   ABitmap.Cache := nil;
+  ReleaseObject(LCache);
 end;
 
 function TGrSharedContext.GetGrDirectContext: TGrDirectContext;
@@ -3152,7 +3157,7 @@ procedure TGrSharedContext.InitializeTextureCache(const ABitmap: TGrBitmapHandle
 var
   LImage: ISkImage;
 begin
-  LImage := ABitmap.MakeRasterSnapshot;
+  LImage := ABitmap.MakeSnapshot;
   if LImage <> nil then
     ABitmap.Cache := LImage.MakeTextureImage(ABitmap.SharedContext.GrDirectContext);
 end;
@@ -3161,28 +3166,97 @@ procedure TGrSharedContext.RefreshContext;
 begin
 end;
 
+// GPU objects must be released with the context locked, but the main thread
+// keeps it locked while it draws a window, and code drawn there can wait for a
+// bitmap locked by another thread. So when the context is locked by another
+// thread, the object is kept until the context is locked again, instead of
+// waiting for it. The objects of OpenGL contexts are released through their
+// overrides instead, since they also need the context to be current.
+procedure TGrSharedContext.ReleaseObject(var AObject: IInterface);
+var
+  LCount: Integer;
+begin
+  if AObject = nil then
+    Exit;
+  if TryLock then
+  begin
+    try
+      AObject := nil;
+    finally
+      Unlock;
+    end;
+  end
+  else
+  begin
+    TMonitor.Enter(FPendingReleasesLock);
+    try
+      LCount := Length(FPendingReleases);
+      SetLength(FPendingReleases, LCount + 1);
+      FPendingReleases[LCount] := AObject;
+    finally
+      TMonitor.Exit(FPendingReleasesLock);
+    end;
+    AObject := nil;
+  end;
+end;
+
+// Must be called with the context locked.
+procedure TGrSharedContext.ReleasePendingObjects;
+var
+  LObjects: TArray<IInterface>;
+begin
+  if FPendingReleases = nil then
+    Exit;
+  TMonitor.Enter(FPendingReleasesLock);
+  try
+    LObjects := FPendingReleases;
+    FPendingReleases := nil;
+  finally
+    TMonitor.Exit(FPendingReleasesLock);
+  end;
+  LObjects := nil;
+end;
+
+// Locks the context only if it is free or already locked by the current
+// thread, without making it current.
+function TGrSharedContext.TryLock: Boolean;
+begin
+  Result := TMonitor.TryEnter(Self);
+  if Result then
+    ReleasePendingObjects;
+end;
+
+procedure TGrSharedContext.Unlock;
+begin
+  TMonitor.Exit(Self);
+end;
+
 { TGrBitmapHandle }
 
 function TGrBitmapHandle.BeginDraw: ISkSurface;
 begin
-  if (not HasGpuContent) and (not CanMoveToGpu) then
-    Exit(inherited);
-  // The shared context stays locked while the GPU surface is being drawn.
-  TGrCanvas.SharedContext.BeginContext;
-  if (FGpuSurface = nil) and (not MoveToGpu) then
+  if CanDrawOnGpu then
   begin
+    // The shared context stays locked while the GPU surface is being drawn.
+    TGrCanvas.SharedContext.BeginContext;
+    if UpdateGpuSurface then
+    begin
+      Inc(FGpuDrawCount);
+      Inc(FDrawCount);
+      Exit(FGpuSurface);
+    end;
     TGrCanvas.SharedContext.EndContext;
-    Exit(inherited);
   end;
-  Inc(FGpuDrawCount);
-  Inc(FDrawCount);
-  Result := FGpuSurface;
+  Result := inherited;
+  if Result <> nil then
+    FGpuOutdated := True;
 end;
 
-function TGrBitmapHandle.CanMoveToGpu: Boolean;
+function TGrBitmapHandle.CanDrawOnGpu: Boolean;
 begin
-  // Bitmaps drawn in other threads stay in memory, so they can still be drawn
-  // in parallel.
+  // Only the main thread draws on the GPU, so other threads never wait for the
+  // shared context. Bitmaps drawn in other threads stay in memory, so they can
+  // still be drawn in parallel.
   Result := GlobalSkiaGpuBitmaps and (not FCpuPreferred) and TGrCanvas.FSupportsGpuBitmaps and
     (TThread.CurrentThread.ThreadID = MainThreadID);
 end;
@@ -3190,54 +3264,78 @@ end;
 destructor TGrBitmapHandle.Destroy;
 begin
   FMapSurface := nil;
-  ReleaseGpuContent;
+  ReleaseGpuSurface;
+  if (FCache <> nil) and (FSharedContext <> nil) then
+    TGrSharedContext(FSharedContext).FinalizeTextureCache(Self);
   FCache := nil;
   inherited;
 end;
 
 procedure TGrBitmapHandle.EndDraw;
+var
+  LPixmap: ISkPixmap;
 begin
   if FGpuDrawCount = 0 then
   begin
     inherited;
     Exit;
   end;
-  Dec(FGpuDrawCount);
-  Dec(FDrawCount);
-  if FMapCount = 0 then
-    FMapSurface := nil;
-  TGrCanvas.SharedContext.EndContext;
+  try
+    if FGpuDrawCount = 1 then
+    begin
+      // The pixels are read back to memory, so that other threads never need
+      // the GPU surface. The content in memory is replaced, so it does not
+      // need to be copied to a new surface first.
+      if FSurface = nil then
+        FImage := nil;
+      LPixmap := PeekPixelsForWrite;
+      if LPixmap <> nil then
+        FGpuSurface.ReadPixels(LPixmap);
+      FGpuOutdated := False;
+    end;
+  finally
+    Dec(FGpuDrawCount);
+    Dec(FDrawCount);
+    if FMapCount = 0 then
+      FMapSurface := nil;
+    TGrCanvas.SharedContext.EndContext;
+  end;
 end;
 
-function TGrBitmapHandle.GetSurface: ISkSurface;
-begin
-  if not MoveToCpu then
-    Exit(nil);
-  Result := inherited;
-end;
-
-function TGrBitmapHandle.HasGpuContent: Boolean;
-begin
-  Result := (FGpuSurface <> nil) or (FGpuImage <> nil);
-end;
-
+// Only the main thread draws on the GPU, so this also indicates that the
+// current thread is drawing the GPU surface and has the shared context locked.
 function TGrBitmapHandle.IsDrawnOnGpu: Boolean;
 begin
-  Result := FGpuDrawCount > 0;
+  Result := (FGpuDrawCount > 0) and (TThread.CurrentThread.ThreadID = MainThreadID);
 end;
 
 function TGrBitmapHandle.IsGpuResident: Boolean;
 begin
-  Result := HasGpuContent;
+  Result := (FGpuSurface <> nil) and (not FGpuOutdated);
 end;
 
-function TGrBitmapHandle.MakeRasterSnapshot: ISkImage;
+// Returns the content as an image of the shared context, or nil when the GPU
+// surface is not up to date. Must be called with the shared context locked.
+function TGrBitmapHandle.MakeGpuSnapshot: ISkImage;
+begin
+  if FGpuSurface = nil then
+    Exit(nil);
+  if FGpuOutdated and (FGpuDrawCount = 0) then
+  begin
+    if FCpuPreferred then
+      ReleaseGpuSurface;
+    Exit(nil);
+  end;
+  Result := FGpuSurface.MakeImageSnapshot;
+end;
+
+function TGrBitmapHandle.MakeSnapshot: ISkImage;
 var
   LSurface: ISkSurface;
 begin
-  if HasGpuContent and (not MoveToCpu) then
+  if IsDrawnOnGpu then
   begin
-    // While the GPU surface is being drawn, its pixels are copied instead.
+    // While the GPU surface is being drawn, its current pixels are copied.
     LSurface := ReadGpuPixels;
     if LSurface = nil then
       Exit(nil);
@@ -3246,30 +3344,23 @@ begin
   Result := inherited;
 end;
 
-function TGrBitmapHandle.MakeSnapshot: ISkImage;
-begin
-  if FGpuSurface <> nil then
-  begin
-    FSharedContext.BeginContext;
-    try
-      Result := FGpuSurface.MakeImageSnapshot;
-    finally
-      FSharedContext.EndContext;
-    end;
-  end
-  else if FGpuImage <> nil then
-    Result := FGpuImage
-  else
-    Result := inherited;
-end;
-
 function TGrBitmapHandle.Map(const AAccess: TMapAccess;
   out ARowBytes: NativeUInt): Pointer;
 var
   LPixmap: ISkPixmap;
 begin
   if not IsDrawnOnGpu then
-    Exit(inherited);
+  begin
+    Result := inherited;
+    if AAccess <> TMapAccess.Read then
+    begin
+      // Bitmaps whose pixels are modified directly are drawn in memory again,
+      // instead of being uploaded after each modification.
+      FCpuPreferred := True;
+      FGpuOutdated  := True;
+    end;
+    Exit;
+  end;
   // While the GPU surface is being drawn, a copy of its pixels is mapped and,
   // when mapped for writing, written back to it by Unmap.
   if FMapCount = 0 then
@@ -3287,55 +3378,12 @@ begin
   Result    := LPixmap.Pixels;
 end;
 
-function TGrBitmapHandle.MoveToCpu: Boolean;
-var
-  LSurface: ISkSurface;
-begin
-  if not HasGpuContent then
-    Exit(True);
-  // The pixels cannot move while the GPU surface is being drawn.
-  if IsDrawnOnGpu then
-    Exit(False);
-  FCpuPreferred := True;
-  LSurface := ReadGpuPixels;
-  ReleaseGpuContent;
-  FSurface := LSurface;
-  FImage   := nil;
-  Result   := True;
-end;
-
-// Must be called with the shared context locked.
-function TGrBitmapHandle.MoveToGpu: Boolean;
-var
-  LImage: ISkImage;
-  LSurface: ISkSurface;
-begin
-  LSurface := TSkSurface.MakeRenderTarget(TGrCanvas.SharedContext.GrDirectContext, True, GetImageInfo, 0, TGrSurfaceOrigin.TopLeft);
-  if LSurface = nil then
-    Exit(False);
-  LSurface.Canvas.Clear(TAlphaColors.Null);
-  if FGpuImage <> nil then
-    LImage := FGpuImage
-  else if (FSurface <> nil) or (FImage <> nil) then
-    LImage := inherited MakeSnapshot;
-  if LImage <> nil then
-    LSurface.Canvas.DrawImage(LImage, 0, 0);
-  LImage         := nil;
-  FSurface       := nil;
-  FImage         := nil;
-  FGpuImage      := nil;
-  FGpuSurface    := LSurface;
-  FSharedContext := TGrCanvas.SharedContext;
-  FCache         := nil;
-  Result := True;
-end;
-
 function TGrBitmapHandle.PeekPixels: ISkPixmap;
 begin
-  if HasGpuContent and (not MoveToCpu) then
+  if IsDrawnOnGpu then
   begin
     // While the GPU surface is being drawn, a copy of its pixels is returned.
-    if FMapSurface = nil then
+    if FMapCount = 0 then
       FMapSurface := ReadGpuPixels;
     if FMapSurface = nil then
       Exit(nil);
@@ -3344,86 +3392,111 @@ begin
   Result := inherited;
 end;
 
+// Must be called while the GPU surface is being drawn.
 function TGrBitmapHandle.ReadGpuPixels: ISkSurface;
 begin
   Result := TSkSurface.MakeRaster(GetImageInfo, GetRowBytes);
-  if Result = nil then
-    Exit;
-  FSharedContext.BeginContext;
-  try
-    if FGpuSurface <> nil then
-      FGpuSurface.ReadPixels(Result.PeekPixels)
-    else
-      FGpuImage.ReadPixels(Result.PeekPixels, 0, 0, TSkImageCachingHint.Allow, FSharedContext.GrDirectContext);
-  finally
-    FSharedContext.EndContext;
-  end;
+  if Result <> nil then
+    FGpuSurface.ReadPixels(Result.PeekPixels);
 end;
 
-procedure TGrBitmapHandle.ReleaseGpuContent;
+// Must be called with the shared context locked, or by the destructor.
+procedure TGrBitmapHandle.ReleaseGpuSurface;
+var
+  LSurface: IInterface;
 begin
-  if HasGpuContent then
-  begin
-    // GPU objects can only be released with the shared context locked.
-    FSharedContext.BeginContext;
-    try
-      FGpuSurface := nil;
-      FGpuImage   := nil;
-    finally
-      FSharedContext.EndContext;
-    end;
-  end;
+  if FGpuSurface = nil then
+    Exit;
+  LSurface     := FGpuSurface;
+  FGpuSurface  := nil;
+  FGpuOutdated := False;
+  TGrSharedContext(FSharedContext).ReleaseObject(LSurface);
 end;
 
 function TGrBitmapHandle.SetContent(const AImage: ISkImage): Boolean;
+var
+  LPixmap: ISkPixmap;
 begin
-  // A GPU surface being drawn receives the image by drawing it.
-  if (FGpuSurface <> nil) and IsInUse then
+  // The content in memory cannot be an image of the shared context.
+  if (AImage <> nil) and AImage.IsTextureBacked then
+    Exit(False);
+  if IsDrawnOnGpu then
   begin
+    // The GPU surface being drawn receives the pixels of the image, since its
+    // canvas has the matrix and clip of the scene.
     if AImage = nil then
       Exit(False);
-    FSharedContext.BeginContext;
-    try
-      FGpuSurface.Canvas.Clear(TAlphaColors.Null);
-      FGpuSurface.Canvas.DrawImage(AImage, 0, 0);
-    finally
-      FSharedContext.EndContext;
-    end;
-    Exit(True);
-  end;
-  if (AImage <> nil) and AImage.IsTextureBacked then
-  begin
-    if IsInUse then
+    LPixmap := AImage.PeekPixels;
+    if LPixmap = nil then
       Exit(False);
-    ReleaseGpuContent;
-    FSurface       := nil;
-    FImage         := nil;
-    FSharedContext := TGrCanvas.SharedContext;
-    FGpuImage      := AImage;
+    FGpuSurface.WritePixels(LPixmap);
     Exit(True);
   end;
-  if not IsInUse then
-    ReleaseGpuContent;
   Result := inherited;
+  if Result then
+    FGpuOutdated := True;
 end;
 
 procedure TGrBitmapHandle.Unmap;
+var
+  LPixmap: ISkPixmap;
 begin
-  if FMapSurface <> nil then
+  if (FMapSurface <> nil) and (TThread.CurrentThread.ThreadID = MainThreadID) then
   begin
-    if FMappedForWrite and (FGpuSurface <> nil) then
+    if FMappedForWrite then
     begin
-      FSharedContext.BeginContext;
-      try
-        FGpuSurface.WritePixels(FMapSurface.PeekPixels);
-      finally
-        FSharedContext.EndContext;
+      if IsDrawnOnGpu then
+        FGpuSurface.WritePixels(FMapSurface.PeekPixels)
+      else
+      begin
+        // The scene ended while the copy was mapped, so it is written to
+        // memory instead.
+        LPixmap := PeekPixelsForWrite;
+        if LPixmap <> nil then
+          FMapSurface.ReadPixels(LPixmap);
+        FGpuOutdated := True;
       end;
     end;
     if FMapCount <= 1 then
       FMapSurface := nil;
+  end
+  else if FMappedForWrite then
+  begin
+    // The GPU surface or the texture may have been updated from the pixels
+    // while they were being modified.
+    FGpuOutdated := True;
+    if (FCache <> nil) and (FSharedContext <> nil) then
+      TGrSharedContext(FSharedContext).FinalizeTextureCache(Self);
   end;
   inherited;
+end;
+
+// Makes the GPU surface hold the current content, uploading it when it has
+// changed in memory. Must be called with the shared context locked.
+function TGrBitmapHandle.UpdateGpuSurface: Boolean;
+var
+  LPixmap: ISkPixmap;
+begin
+  if FGpuSurface = nil then
+  begin
+    FGpuSurface := TSkSurface.MakeRenderTarget(TGrCanvas.SharedContext.GrDirectContext, True, GetImageInfo, 0, TGrSurfaceOrigin.TopLeft);
+    if FGpuSurface = nil then
+      Exit(False);
+    if FSharedContext = nil then
+      FSharedContext := TGrCanvas.SharedContext;
+    FGpuOutdated := True;
+  end;
+  if FGpuOutdated then
+  begin
+    FGpuOutdated := False;
+    if (FSurface <> nil) or (FImage <> nil) then
+      LPixmap := inherited PeekPixels;
+    if LPixmap <> nil then
+      FGpuSurface.WritePixels(LPixmap)
+    else
+      FGpuSurface.Canvas.Clear(TAlphaColors.Null);
+  end;
+  Result := True;
 end;
 
 { TGrCanvas }
@@ -3457,33 +3530,36 @@ class function TGrCanvas.CopyBitmapHandle(const ASource,
   ADest: TSkBitmapHandle): Boolean;
 var
   LDest: TGrBitmapHandle;
+  LImage: ISkImage;
   LSource: TGrBitmapHandle;
 begin
   if ASource = ADest then
     Exit(True);
-  // The snapshot of a GPU surface must be made and released with the shared
-  // context locked.
-  if FSharedContext <> nil then
-    FSharedContext.BeginContext;
+  Result := inherited;
+  if not Result then
+    Exit;
+  LSource := TGrBitmapHandle(ASource);
+  LDest   := TGrBitmapHandle(ADest);
+  if LDest.Cache <> nil then
+    TGrSharedContext(LDest.FSharedContext).FinalizeTextureCache(LDest);
+  // Textures are immutable, so the destination can share the one of the
+  // source as well, unless it is still being modified. They can only be used
+  // with the shared context locked, which is skipped when another thread has
+  // it, so that copies never wait for it.
+  if LDest.IsInUse or (FSharedContext = nil) or (not TGrSharedContext(FSharedContext).TryLock) then
+    Exit;
   try
-    Result := inherited;
-    if Result then
+    LImage := LSource.MakeGpuSnapshot;
+    if LImage = nil then
+      LImage := LSource.Cache;
+    if LImage <> nil then
     begin
-      LSource := TGrBitmapHandle(ASource);
-      LDest   := TGrBitmapHandle(ADest);
-      if LDest.Cache <> nil then
-        TGrSharedContext(LDest.FSharedContext).FinalizeTextureCache(LDest);
-      // Textures are immutable, so the destination can share the one of the
-      // source as well, unless it is still being modified.
-      if (LSource.Cache <> nil) and (not LDest.IsInUse) then
-      begin
-        LDest.FSharedContext := LSource.FSharedContext;
-        LDest.Cache := LSource.Cache;
-      end;
+      if LDest.FSharedContext = nil then
+        LDest.FSharedContext := FSharedContext;
+      LDest.Cache := LImage;
     end;
   finally
-    if FSharedContext <> nil then
-      FSharedContext.EndContext;
+    TGrSharedContext(FSharedContext).Unlock;
   end;
 end;
 
@@ -3571,16 +3647,17 @@ begin
   begin
     LBitmap := TGrBitmapHandle(ABitmap.Handle);
     LWithSharedContext := DrawsWithSharedContext;
-    if LBitmap.HasGpuContent then
+    // A bitmap drawn on the GPU is drawn from its GPU surface, without being
+    // uploaded.
+    if LWithSharedContext then
     begin
-      // Its texture is drawn directly, without copies.
-      if LWithSharedContext then
-        Exit(LBitmap.MakeSnapshot);
-    end
-    else if (LWithSharedContext or SupportsCachedImage) and (GetCachedImage(ABitmap) <> nil) then
+      Result := LBitmap.MakeGpuSnapshot;
+      if Result <> nil then
+        Exit;
+    end;
+    if (LWithSharedContext or SupportsCachedImage) and (GetCachedImage(ABitmap) <> nil) then
       Exit(LBitmap.Cache);
   end;
-  // Moves a GPU bitmap to memory, since this canvas cannot draw its texture.
   Result := inherited;
 end;
 

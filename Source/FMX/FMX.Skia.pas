@@ -1305,6 +1305,9 @@ var
   /// <summary> Enables TBitmaps to be drawn in true parallel to UI and other bitmaps, when drawing in a thread (only takes effect when GlobalUseSkia is True) [Experimental] </summary>
   GlobalSkiaBitmapsInParallel: Boolean;
   {$ENDIF}
+  /// <summary> Allows TBitmaps drawn through their canvas in the main thread to keep their pixels on the GPU, so they are drawn on forms without being uploaded (only takes effect when the Skia canvas uses Metal or Vulkan) </summary>
+  /// <remarks> Accessing the pixels of such a bitmap from the CPU (e.g. Map or ToSkImage) moves them back to memory, where they stay </remarks>
+  GlobalSkiaGpuBitmaps: Boolean = True;
   /// <summary> Specifies the locale to determine language-specific rules for texts rendered by Skia. </summary>
   GlobalSkiaTextLocale: string;
   /// <summary> Enables LCD antialiasing (ClearType) for texts rendered by Skia on Windows. </summary>
@@ -1679,7 +1682,7 @@ begin
   begin
     TMonitor.Enter(Self);
     try
-      Result := TSkBitmapHandle(Handle).MakeSnapshot;
+      Result := TSkBitmapHandle(Handle).MakeRasterSnapshot;
     finally
       TMonitor.Exit(Self);
     end;
@@ -6445,6 +6448,7 @@ end;
 {$HPPEMIT END '    using ::Fmx::Skia::GlobalUseSkiaFilters;'}
 {$HPPEMIT END '    using ::Fmx::Skia::GlobalSkiaBitmapsInParallel;'}
 {$ENDIF}
+{$HPPEMIT END '    using ::Fmx::Skia::GlobalSkiaGpuBitmaps;'}
 {$HPPEMIT END '    using ::Fmx::Skia::GlobalSkiaTextLocale;'}
 {$HPPEMIT END '    using ::Fmx::Skia::GlobalSkiaSubpixelText;'}
 {$HPPEMIT END '    using ::Fmx::Skia::SkFmxColorType;'}
